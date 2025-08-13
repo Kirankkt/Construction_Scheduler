@@ -1,8 +1,13 @@
+import os
 import re
+import json
 from typing import List, Dict, Any, Tuple, Optional
 import pandas as pd
-import fitz  # PyMuPDF
 from rapidfuzz import fuzz, process
+
+# -----------------------------
+# CSV helpers
+# -----------------------------
 
 DAY_COL_PATTERN = re.compile(r"^Day\s*(\d+)$", re.IGNORECASE)
 
@@ -17,11 +22,10 @@ def _safe_series_get(row: pd.Series, key: Optional[str]):
 def _detect_day_triplets(columns: List[str]) -> List[Tuple[str, Optional[str], Optional[str], int]]:
     """
     Return a list of (day_col, time_col, labour_col, day_index) sorted by day number.
-    Tolerates missing column names after some Day N (exported as 'Unnamed: xx').
-    Heuristic:
+    Tolerates Excel 'Unnamed' columns after Day N:
       - Try canonical names: Time (hours)[.k], Labor (workers)[.k]
-      - Else, use the next two physical columns after Day N as time/labour if present.
-      - Else, set them to None (parser will treat as missing).
+      - Else, use the next two physical columns after Day N (if not another Day column)
+      - Else, set them to None (duration, labour treated as missing)
     """
     days_idx = []
     for i, c in enumerate(columns):
@@ -34,16 +38,14 @@ def _detect_day_triplets(columns: List[str]) -> List[Tuple[str, Optional[str], O
     for ordinal, (i, day_col, dnum) in enumerate(days_idx):
         suffix = "" if ordinal == 0 else f".{ordinal}"
         canon_time = f"Time (hours){suffix}"
-        canon_lab = f"Labor (workers){suffix}"
+        canon_lab  = f"Labor (workers){suffix}"
 
         time_col = canon_time if canon_time in columns else None
         labour_col = canon_lab if canon_lab in columns else None
 
         if time_col is None or labour_col is None:
-            # Try using the next two columns physically after day_col
             nxt1 = columns[i+1] if i + 1 < len(columns) else None
             nxt2 = columns[i+2] if i + 2 < len(columns) else None
-            # Only adopt if they are not another Day column
             if time_col is None and nxt1 and not DAY_COL_PATTERN.match(str(nxt1)):
                 time_col = nxt1
             if labour_col is None and nxt2 and not DAY_COL_PATTERN.match(str(nxt2)):
@@ -95,6 +97,7 @@ def parse_csv_to_tasks(csv_path: str,
         if _is_section_header(row, triplets):
             current_section = label
             continue  # next row
+
         # Non-header row: treat 'label' as subsection name
         subsection = label
         for (day_col, time_col, labour_col, dnum) in triplets:
@@ -141,13 +144,95 @@ def parse_csv_to_tasks(csv_path: str,
 
     return tasks, warnings
 
-# -------- PDF parsing --------
+# -----------------------------
+# PDF note caching
+# -----------------------------
 
+def _pdf_cache_file(cache_dir: str = "data") -> str:
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "drawing_notes_cache.json")
+
+def _quick_sig(path: str) -> Dict[str, int]:
+    """Fast file signature: size + mtime (good enough to detect changes)."""
+    st = os.stat(path)
+    return {"size": int(st.st_size), "mtime": int(st.st_mtime)}
+
+def load_drawing_notes_from_cache(cache_dir: str = "data") -> List[str]:
+    """Load all cached notes (no parsing). Returns [] if cache missing/empty."""
+    cache_path = _pdf_cache_file(cache_dir)
+    if not os.path.exists(cache_path):
+        return []
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        return []
+    notes: List[str] = []
+    for rec in cache.values():
+        notes.extend(rec.get("notes", []))
+    return notes
+
+def rebuild_drawing_notes_cache(pdf_paths: List[str], cache_dir: str = "data") -> List[str]:
+    """
+    Parse PDFs (only those that changed), update cache, and return all notes.
+    Lazy-imports PyMuPDF so the app can boot instantly.
+    """
+    cache_path = _pdf_cache_file(cache_dir)
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        # If PyMuPDF isn't available in the environment, degrade gracefully
+        # and just keep (or create) an empty cache.
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        return load_drawing_notes_from_cache(cache_dir)
+
+    changed = False
+    for p in pdf_paths:
+        key = os.path.basename(p)
+        sig = _quick_sig(p)
+        rec = cache.get(key)
+        if rec and rec.get("sig") == sig:
+            # unchanged
+            continue
+
+        # parse this PDF
+        notes = []
+        doc = fitz.open(p)
+        seen = set()
+        for page in doc:
+            text = page.get_text()
+            for raw in text.splitlines():
+                line = raw.strip()
+                if line.lower().startswith("note -"):
+                    content = line[6:].strip()
+                    if content and content not in seen:
+                        notes.append(content)
+                        seen.add(content)
+        doc.close()
+
+        cache[key] = {"sig": sig, "notes": notes}
+        changed = True
+
+    if changed:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+
+    return load_drawing_notes_from_cache(cache_dir)
+
+# (Kept for completeness; unused by app.py)
 def extract_drawing_notes(pdf_paths: List[str]) -> List[str]:
-    """
-    Extract 'Note - ...' lines from one or more PDFs.
-    Returns a list of cleaned note strings.
-    """
+    """Non-cached extraction (used only if you call it directly)."""
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        return []
     notes: List[str] = []
     seen = set()
     for path in pdf_paths:
@@ -163,6 +248,10 @@ def extract_drawing_notes(pdf_paths: List[str]) -> List[str]:
                         seen.add(content)
         doc.close()
     return notes
+
+# -----------------------------
+# Fuzzy matching
+# -----------------------------
 
 def match_notes_to_tasks(notes: List[str], tasks: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
     """
