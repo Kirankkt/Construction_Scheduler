@@ -145,7 +145,7 @@ def parse_csv_to_tasks(csv_path: str,
     return tasks, warnings
 
 # -----------------------------
-# PDF note caching
+# PDF note caching + parsers
 # -----------------------------
 
 def _pdf_cache_file(cache_dir: str = "data") -> str:
@@ -156,6 +156,50 @@ def _quick_sig(path: str) -> Dict[str, int]:
     """Fast file signature: size + mtime (good enough to detect changes)."""
     st = os.stat(path)
     return {"size": int(st.st_size), "mtime": int(st.st_mtime)}
+
+def _parse_pdf_notes_with_pymupdf(pdf_path: str) -> List[str]:
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        return []
+    notes, seen = [], set()
+    doc = fitz.open(pdf_path)
+    for page in doc:
+        text = page.get_text()
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.lower().startswith("note -"):
+                content = line[6:].strip()
+                if content and content not in seen:
+                    notes.append(content)
+                    seen.add(content)
+    doc.close()
+    return notes
+
+def _parse_pdf_notes_with_pdfplumber(pdf_path: str) -> List[str]:
+    try:
+        import pdfplumber
+    except Exception:
+        return []
+    notes, seen = [], set()
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for raw in text.splitlines():
+                line = raw.strip()
+                if line.lower().startswith("note -"):
+                    content = line[6:].strip()
+                    if content and content not in seen:
+                        notes.append(content)
+                        seen.add(content)
+    return notes
+
+def _parse_pdf_notes(pdf_path: str) -> List[str]:
+    # Prefer PyMuPDF if available, else fallback to pdfplumber
+    out = _parse_pdf_notes_with_pymupdf(pdf_path)
+    if out:
+        return out
+    return _parse_pdf_notes_with_pdfplumber(pdf_path)
 
 def load_drawing_notes_from_cache(cache_dir: str = "data") -> List[str]:
     """Load all cached notes (no parsing). Returns [] if cache missing/empty."""
@@ -175,7 +219,7 @@ def load_drawing_notes_from_cache(cache_dir: str = "data") -> List[str]:
 def rebuild_drawing_notes_cache(pdf_paths: List[str], cache_dir: str = "data") -> List[str]:
     """
     Parse PDFs (only those that changed), update cache, and return all notes.
-    Lazy-imports PyMuPDF so the app can boot instantly.
+    Uses PyMuPDF if present; otherwise uses pdfplumber (pure Python).
     """
     cache_path = _pdf_cache_file(cache_dir)
     try:
@@ -184,39 +228,15 @@ def rebuild_drawing_notes_cache(pdf_paths: List[str], cache_dir: str = "data") -
     except Exception:
         cache = {}
 
-    try:
-        import fitz  # PyMuPDF
-    except Exception:
-        # If PyMuPDF isn't available in the environment, degrade gracefully
-        # and just keep (or create) an empty cache.
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-        return load_drawing_notes_from_cache(cache_dir)
-
     changed = False
     for p in pdf_paths:
         key = os.path.basename(p)
         sig = _quick_sig(p)
         rec = cache.get(key)
         if rec and rec.get("sig") == sig:
-            # unchanged
-            continue
+            continue  # unchanged
 
-        # parse this PDF
-        notes = []
-        doc = fitz.open(p)
-        seen = set()
-        for page in doc:
-            text = page.get_text()
-            for raw in text.splitlines():
-                line = raw.strip()
-                if line.lower().startswith("note -"):
-                    content = line[6:].strip()
-                    if content and content not in seen:
-                        notes.append(content)
-                        seen.add(content)
-        doc.close()
-
+        notes = _parse_pdf_notes(p)
         cache[key] = {"sig": sig, "notes": notes}
         changed = True
 
@@ -226,27 +246,11 @@ def rebuild_drawing_notes_cache(pdf_paths: List[str], cache_dir: str = "data") -
 
     return load_drawing_notes_from_cache(cache_dir)
 
-# (Kept for completeness; unused by app.py)
+# (Optional legacy API)
 def extract_drawing_notes(pdf_paths: List[str]) -> List[str]:
-    """Non-cached extraction (used only if you call it directly)."""
-    try:
-        import fitz  # PyMuPDF
-    except Exception:
-        return []
     notes: List[str] = []
-    seen = set()
-    for path in pdf_paths:
-        doc = fitz.open(path)
-        for page in doc:
-            text = page.get_text()
-            for raw in text.splitlines():
-                line = raw.strip()
-                if line.lower().startswith("note -"):
-                    content = line[6:].strip()
-                    if content and content not in seen:
-                        notes.append(content)
-                        seen.add(content)
-        doc.close()
+    for p in pdf_paths:
+        notes.extend(_parse_pdf_notes(p))
     return notes
 
 # -----------------------------
